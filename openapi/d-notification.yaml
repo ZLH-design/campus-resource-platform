@@ -1,0 +1,277 @@
+openapi: 3.1.0
+
+info:
+  title: D-003 统一通知接口
+  version: 0.1.0-draft
+  description: |
+    供 M1/M2/M3 提交站内通知。业务模块只调本接口，不绑定具体渠道。
+
+    **草案，待 C 确认后冻结。**
+
+    按需求基线 §7.2：v0.1 只实现站内通知表 + 控制台发送器，
+    **邮件与微信渠道列入后续迭代，本轮不做。**
+
+servers:
+  - url: http://localhost:8084
+    description: 本地 d-service
+  - url: http://d-service:8084
+    description: Docker Compose 内部网络
+
+tags:
+  - name: Notification
+    description: 通知
+
+paths:
+  /api/d/notifications:
+    post:
+      tags: [Notification]
+      operationId: createNotification
+      summary: 提交一条通知
+      description: |
+        调用方只负责说"发给谁、什么类型、什么内容"，不关心怎么发。
+
+        失败处理：通知失败**不阻断主业务**。例如预约创建成功后通知失败，
+        预约依然成立，调用方只需记录日志。
+
+        幂等：以 `X-Idempotency-Key` 为去重依据（`<模块>:<业务单UUID>:<类型>`），
+        重复提交不重复发送。
+      parameters:
+        - $ref: './common.yaml#/components/parameters/TraceId'
+        - $ref: './common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NotificationCommand'
+            examples:
+              bookingApproved:
+                summary: M2 审批通过通知申请人
+                value:
+                  type: BOOKING_APPROVED
+                  recipientId: 3f1c9a2e-8b4d-4f6a-9e21-7c5d0b8a1f33
+                  content: 你申请的图书馆三层自习室 10-22 09:00-13:00 已通过审批
+                  bizRef:
+                    sourceType: M2
+                    sourceId: 8d2b7c11-4e6a-4c3b-9f18-5a0e7d2c6b94
+              reservationReminder:
+                summary: M1 预约前 15 分钟提醒
+                value:
+                  type: RESERVATION_REMINDER
+                  recipientId: 3f1c9a2e-8b4d-4f6a-9e21-7c5d0b8a1f33
+                  content: 你的座位 A-12 将于 15 分钟后开始使用
+                  bizRef:
+                    sourceType: M1
+                    sourceId: 5c9e2f13-7a4b-4d81-b3c6-9e0f2a7d4c58
+      responses:
+        '200':
+          description: 已受理（含幂等命中）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationResult'
+              example:
+                notificationId: 7a1b2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d
+                created: true
+                channel: IN_APP
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    get:
+      tags: [Notification]
+      operationId: listMyNotifications
+      summary: 查询我收到的通知
+      description: 站内信列表，按时间倒序。不做分页，本轮最多返回 100 条。
+      parameters:
+        - name: unreadOnly
+          in: query
+          schema: { type: boolean, default: false }
+        - $ref: './common.yaml#/components/parameters/TraceId'
+      responses:
+        '200':
+          description: 通知列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Notification'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/d/notifications/batch:
+    post:
+      tags: [Notification]
+      operationId: createNotificationBatch
+      summary: 批量提交通知
+      description: |
+        **草案条款，待 C 确认。** 此接口是清退流程的硬前提（风险 R16）。
+
+        场景：M1 清退整间教室的座位时，可能有几十个学生需要同时收到通知。
+        若逐个调用单条接口，中途失败会造成「一半人收到、一半人没收到」，
+        这与 `common.yaml` 的 CP-3（取消与通知必须原子完成）直接冲突。
+
+        语义要求：
+        - **整批成功或整批失败**，不接受部分成功
+        - 单批上限 200 条，超出返回 400
+        - 幂等键作用于整批：`<模块>:<业务单UUID>:<类型>`，重复提交整批不重发
+        - 同单条接口一样，**通知失败不阻断主业务**（M1 侧的清退已经完成，
+          只记录日志后续补发）
+      parameters:
+        - $ref: './common.yaml#/components/parameters/TraceId'
+        - $ref: './common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [type, bizRef, items]
+              properties:
+                type:
+                  type: string
+                  description: 整批统一类型，与单条接口共用 NotificationType 字典
+                bizRef:
+                  $ref: '#/components/schemas/BizRef'
+                  description: 整批统一业务来源（如 M3 的某个工单）
+                items:
+                  type: array
+                  maxItems: 200
+                  minItems: 1
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [recipientId, content]
+                    properties:
+                      recipientId:
+                        type: string
+                        format: uuid
+                      content:
+                        type: string
+            examples:
+              eviction:
+                summary: M1 因维修清退整间教室的预约
+                value:
+                  type: RESERVATION_EVICTED
+                  bizRef:
+                    sourceType: M3
+                    sourceId: 8d2b7c11-4e6a-4c3b-9f18-5a0e7d2c6b94
+                  items:
+                    - recipientId: 3f1c9a2e-8b4d-4f6a-9e21-7c5d0b8a1f33
+                      content: 你预约的图书馆三层自习室 A-12 因空调维修已取消，请重新预约
+                    - recipientId: 9e4b1a77-2c8d-4f3e-8b16-7a5d2c9e0f41
+                      content: 你预约的图书馆三层自习室 A-13 因空调维修已取消，请重新预约
+      responses:
+        '200':
+          description: 整批已受理（含幂等命中）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [acceptedCount]
+                properties:
+                  acceptedCount:
+                    type: integer
+                    description: 受理条数。整批成功时等于请求条数
+                  created:
+                    type: boolean
+                    description: false 表示幂等命中，整批未重复发送
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+components:
+  schemas:
+    NotificationCommand:
+      type: object
+      additionalProperties: false
+      required: [type, recipientId, content]
+      properties:
+        type:
+          type: string
+          enum:
+            - RESERVATION_REMINDER
+            - CHECKIN_REMINDER
+            - RESERVATION_AUTO_CANCEL
+            - BOOKING_APPROVED
+            - BOOKING_REJECTED
+            - TICKET_ASSIGNED
+            - TICKET_ESCALATED
+            - RESERVATION_EVICTED
+        recipientId:
+          type: string
+          format: uuid
+        content:
+          type: string
+          description: 通知正文，纯文本，最长 500 字
+        bizRef:
+          $ref: '#/components/schemas/BizRef'
+
+    BizRef:
+      type: object
+      additionalProperties: false
+      description: 关联业务对象，便于点击跳转与排查。单条与批量共用
+      properties:
+        sourceType:
+          type: string
+          enum: [M1, M2, M3]
+        sourceId:
+          type: string
+          format: uuid
+
+    NotificationResult:
+      type: object
+      required: [notificationId, created, channel]
+      properties:
+        notificationId:
+          type: string
+          format: uuid
+        created:
+          type: boolean
+        channel:
+          type: string
+          enum: [IN_APP]
+          description: 本轮只有站内信，接口层面预留字段
+
+    Notification:
+      type: object
+      required: [id, type, content, channel, read, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        type:
+          type: string
+        content:
+          type: string
+        channel:
+          type: string
+        read:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+
+  responses:
+    BadRequest:
+      description: 参数非法
+      content:
+        application/json:
+          schema: { $ref: './common.yaml#/components/schemas/ErrorResponse' }
+          example:
+            code: INVALID_ARGUMENT
+            message: type is not a valid enum value
+            traceId: a1b2c3d4
+    Unauthorized:
+      description: 无 token 或失效
+      content:
+        application/json:
+          schema: { $ref: './common.yaml#/components/schemas/ErrorResponse' }
+          example:
+            code: UNAUTHORIZED
+            message: missing or invalid bearer token
+            traceId: a1b2c3d4

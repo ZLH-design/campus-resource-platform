@@ -1,0 +1,237 @@
+openapi: 3.1.0
+
+info:
+  title: D-001 身份、鉴权与权限校验
+  version: 0.1.0-draft
+  description: |
+    供 M1/M2/M3 校验 token、判断权限。同时也是前端登录入口。
+
+    **草案，待 A 确认后冻结。**
+
+    关键待决（PD-001）：四个服务如何校验 JWT？本文件按 **JWKS 方案**起草 ——
+    d-service 暴露公钥端点，其他服务本地校验签名，不每次回源。
+    若 A 选择其他方案，本文件需相应修改。
+
+servers:
+  - url: http://localhost:8084
+    description: 本地 d-service
+  - url: http://d-service:8084
+    description: Docker Compose 内部网络
+
+tags:
+  - name: Auth
+    description: 认证
+  - name: Permission
+    description: 权限
+
+paths:
+  /api/d/auth/.well-known/jwks.json:
+    get:
+      tags: [Auth]
+      operationId: getJwks
+      summary: 获取 JWT 公钥集
+      description: |
+        **不需要认证。** 各服务启动时拉取一次并缓存，之后本地校验 JWT 签名，
+        避免每次请求都回调 d-service。
+
+        公钥轮换时，新旧密钥并存一段时间（`kid` 区分），服务端缓存过期后自动更新。
+      security: []
+      responses:
+        '200':
+          description: JWKS
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [keys]
+                properties:
+                  keys:
+                    type: array
+                    items:
+                      type: object
+                      required: [kty, kid, use, n, e]
+                      properties:
+                        kty: { type: string, enum: [RSA] }
+                        kid: { type: string }
+                        use: { type: string, enum: [sig] }
+                        alg: { type: string, enum: [RS256] }
+                        n: { type: string }
+                        e: { type: string }
+
+  /api/d/auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: 登录换取 token
+      description: |
+        本轮只做用户名密码登录，不做第三方登录。
+        成功后返回 JWT，前端存在本地，后续请求放 `Authorization: Bearer <token>`。
+
+        审计要求：登录成功与失败都要写 `LOGIN` 审计（见 d-audit.yaml）。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string, format: password }
+      responses:
+        '200':
+          description: 登录成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/d/permissions/check:
+    post:
+      tags: [Permission]
+      operationId: checkPermission
+      summary: 校验当前用户是否具备某权限
+      description: |
+        业务模块在敏感操作前调用。
+
+        **失败处理策略（重要）**：d-service 不可用时，
+        涉及权限判断的**写操作必须失败**，不得默认放行（见 INT-003）。
+        读操作可按业务需要降级，但必须在日志中标记。
+      parameters:
+        - $ref: './common.yaml#/components/parameters/TraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PermissionCheckCommand'
+            example:
+              action: BOOKING_APPROVE
+              resourceType: BOOKING_REQUEST
+              resourceId: 8d2b7c11-4e6a-4c3b-9f18-5a0e7d2c6b94
+      responses:
+        '200':
+          description: 校验结果（无论允许或拒绝都返回 200，用 allowed 字段区分）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PermissionCheckResult'
+              example:
+                allowed: false
+                reason: role APPROVER_DEPT cannot approve request of another department
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/d/me:
+    get:
+      tags: [Auth]
+      operationId: getCurrentUser
+      summary: 获取当前登录用户信息
+      parameters:
+        - $ref: './common.yaml#/components/parameters/TraceId'
+      responses:
+        '200':
+          description: 用户信息
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurrentUser'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+components:
+  schemas:
+    TokenResponse:
+      type: object
+      required: [accessToken, tokenType, expiresIn]
+      properties:
+        accessToken:
+          type: string
+        tokenType:
+          type: string
+          enum: [Bearer]
+        expiresIn:
+          type: integer
+          description: 有效期（秒）
+
+    PermissionCheckCommand:
+      type: object
+      additionalProperties: false
+      required: [action, resourceType]
+      properties:
+        action:
+          type: string
+          description: 动作标识，大写蛇形
+          enum:
+            - RESERVATION_CREATE
+            - RESERVATION_CANCEL
+            - BOOKING_SUBMIT
+            - BOOKING_APPROVE
+            - TICKET_SUBMIT
+            - TICKET_ASSIGN
+            - TICKET_ACCEPT
+            - TICKET_COMPLETE
+            - PARAM_WRITE
+            - ROLE_MANAGE
+        resourceType:
+          type: string
+          enum: [ROOM, SEAT, BOOKING_REQUEST, REPAIR_TICKET, SYSTEM_PARAM, USER]
+        resourceId:
+          type: string
+          format: uuid
+        actorType:
+          type: string
+          enum: [USER, SYSTEM]
+          default: USER
+          description: |
+            **草案条款，待 A 确认。** 发起方类型，对应 `common.yaml` 的 `x-system-identity`。
+
+            - `USER`（默认）：按 `Role` 做常规 RBAC 判断
+            - `SYSTEM`：定时任务。跳过角色判断，改查服务账号白名单（SI-3）
+
+            定时任务**必须显式传 SYSTEM**。不传会被当作普通用户，
+            因无有效角色而被拒绝 —— 这是有意的设计，防止系统操作悄悄借道用户身份。
+
+    PermissionCheckResult:
+      type: object
+      required: [allowed]
+      properties:
+        allowed:
+          type: boolean
+        reason:
+          type: string
+          description: 拒绝原因，便于排障。允许时可为空
+
+    CurrentUser:
+      type: object
+      additionalProperties: false
+      required: [id, username, roles]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: 与 JWT 的 sub 一致
+        username:
+          type: string
+        roles:
+          type: array
+          items:
+            $ref: './common.yaml#/components/schemas/Role'
+        dept:
+          type: string
+          format: uuid
+
+  responses:
+    Unauthorized:
+      description: 凭证无效或用户名密码错误
+      content:
+        application/json:
+          schema: { $ref: './common.yaml#/components/schemas/ErrorResponse' }
+          example:
+            code: UNAUTHORIZED
+            message: invalid username or password
+            traceId: a1b2c3d4

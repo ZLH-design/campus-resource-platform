@@ -1,0 +1,465 @@
+openapi: 3.1.0
+
+info:
+  title: Campus Resource Platform - Common Vocabulary
+  version: 0.1.0-draft
+  description: |
+    全组共享字典。**任何跨模块可见的字符串、枚举、结构必须在此定义，禁止各模块自建。**
+
+    本文件为草案，需 A（架构）确认后归档生效，届时状态改为 FROZEN。
+    变更本文件等同变更跨模块契约，按 CODEOWNERS 走全组批准。
+
+    来源：由 B 起草，依据需求基线 §7 固定技术方案 + m1-seat-restriction.yaml 已有约定。
+    未决事项集中在文件末尾 x-pending-decisions，需 A / E / C / D 确认。
+
+servers:
+  - url: http://localhost:8080
+    description: 经 Nginx 网关统一入口
+
+x-routing-convention:
+  description: 路由按模块前缀划分，Nginx 依此转发。两个模块不可能写出同名路径。
+  prefixes:
+    M1: /api/m1/**
+    M2: /api/m2/**
+    M3: /api/m3/**
+    D:  /api/d/**
+
+x-flyway-version-ranges:
+  description: 迁移脚本版本号按模块分段，避免四人同时开发时版本号撞车
+  M1: V1xx__   # 例：V101__create_seat_restriction.sql
+  M2: V2xx__
+  M3: V3xx__
+  D:  V4xx__
+
+x-availability-rule:
+  description: |
+    **「某座位在某时段是否可用」的唯一判定口径，全组共用。**
+    三个模块都要理解这条，任何一方按自己的理解算，前端就会看到对不上的结果。
+
+    判定执行方是 M1（只有 m1 schema 同时握有 restriction 与 reservation）。
+    M2 / M3 / 前端不得自行推算，一律查 M1。
+
+    一个座位在时段 [from, to) 可用，当且仅当以下三条同时成立：
+
+      1. 主数据 `Room.status = ACTIVE` 且 `Seat.status = ACTIVE`（永久状态正常）
+      2. 该时段内不存在该座位的**个人预约**（reservation 表）
+      3. 该时段内不存在 `status = ACTIVE` 的 **seat_restriction**
+
+    三条之外的任何「不可用」都必须先落进 seat_restriction，不允许另设状态字段。
+  formula: available = master_active AND no_reservation AND no_active_restriction
+  evaluation_owner: M1
+  sources:
+    - source: 个人预约
+      table: m1.reservation
+      written_by: M1
+    - source: M2 审批占用
+      table: m1.seat_restriction
+      sourceType: M2
+      written_by: M2 经 POST /api/m1/seat-restrictions
+    - source: M3 维修下架
+      table: m1.seat_restriction
+      sourceType: M3
+      written_by: M3 经 POST /api/m1/seat-restrictions
+  note: |
+    主数据服务不参与可用性判定，它不知道预约与限制的存在。
+    见 d-space-master-data.yaml 与 m1-seat-restriction.yaml。
+
+x-system-identity:
+  description: |
+    **定时任务（无人操作）以什么身份运行。全组共用，不得各写各的。**
+
+    三个模块都有定时任务，它们触发时**没有任何人类用户在线**：
+
+      - M1  未签到自动取消   （CHECKIN_TIMEOUT_MINUTES = 15）
+      - M2  审批超时自动撤销 （BOOKING_APPROVAL_TIMEOUT_DAYS = 3）
+      - M3  工单超时升级     （阈值参数待补）
+
+    这些任务去调 D-001 权限校验时没有用户 JWT，
+    `d-auth.yaml` 只规定了「d-service 不可用时写操作必须失败」，
+    **没有规定「调用方压根没有用户身份」怎么办** —— 本块补上这个空白。
+  rules:
+    - id: SI-1
+      rule: 定时任务以 `SYSTEM` 身份运行，**严禁借用任何真实用户的 token**
+      reason: |
+        借用用户 token 会让审计记录张冠李戴 —— 系统自动撤销的操作
+        会记到某个倒霉学生的头上，违约记录尤其致命。
+    - id: SI-2
+      rule: |
+        JWT 中 `actorType=SYSTEM`，且必须携带 `taskId`（见 JwtClaims）。
+        `sub` 填系统服务账号的固定 UUID，`roles` 为空数组
+      reason: SYSTEM 不做 RBAC 角色判断，授权改由服务账号白名单控制
+    - id: SI-3
+      rule: SYSTEM 身份的授权走**服务账号白名单**，不查 Role
+      reason: |
+        定时任务要做的动作是固定的（超时撤销、超时升级），
+        不需要也不应该参与角色体系。白名单由 A 在配置中维护。
+      depends_on: PD-004
+    - id: SI-4
+      rule: SYSTEM 身份产生的操作**照常写审计**，`actorId` 记系统账号，`taskId` 一并记录
+      reason: 自动化操作更要能追溯；不写审计就查不出为什么会撤销
+      owner: D
+    - id: SI-5
+      rule: |
+        定时任务**不得假设自己只会跑一次**。
+        重复触发的防护靠「业务状态判断 + taskId 去重」，不靠调度器
+      reason: |
+        服务重启、容器漂移、调度器补跑都会造成重复执行。
+        例如「超时撤销」必须先判断该申请是否仍处于 PENDING 且已超时，
+        已处理过的直接跳过 —— 而不是假设上一轮已经处理完了。
+  open_question: |
+    系统服务账号的 token 如何获取（预置长期密钥 / 短期凭证 / 内部 mTLS）
+    **归入 PD-004（服务间调用凭证）一并决定**，不在本块单独定义。
+  owner: A
+
+x-conflict-priority:
+  description: |
+    **多个来源抢同一间教室时，谁让位。全组共用，不得自行解释。**
+
+    优先级从高到低：
+
+      1. M3 物业报修    —— 安全与设施问题，最高
+      2. M2 整教室借用  —— 审批通过的集体活动
+      3. M1 个人座位预约 —— 最末
+
+    高优先级生效时，低优先级的已有占用由 M1 清退并通知。
+  order: [M3, M2, M1]
+  rules:
+    - id: CP-1
+      rule: |
+        被清退的预约**不记违约** —— 无论预约是否已开始、学生是否已签到。
+        签到记录随预约一并失效；后续任何定时任务扫到已取消的预约一律跳过，
+        不得补记违约
+      reason: |
+        不是学生的过错；违约只记录学生自身行为（未签到等）。
+        已签到后被清退的学生人可能就在教室里，通知文案须区分（见 m1 契约处置一）。
+      owner: D
+    - id: CP-2
+      rule: 清退**不可逆**
+      reason: |
+        学生已收到取消通知，再恢复会造成更大混乱。
+        即使维修提前结束或借用被撤销，也不恢复已清退的预约 —— 通知中提示重新预约。
+    - id: CP-3
+      rule: 取消与通知必须在 M1 内部**一次调用内原子完成**
+      reason: |
+        禁止调用方自行「查预约 → 逐个取消 → 逐个通知」。
+        中途失败会造成一半人收到通知、一半人没收到。
+        见 m1-seat-restriction.yaml 的 onConflict 字段。
+    - id: CP-4
+      rule: RELEASE 只解除自己来源的限制，不恢复任何已清退的预约
+      reason: 与 CP-2 一致；RELEASE 是幂等的解除动作，不是回滚
+    - id: CP-5
+      rule: |
+        M3 APPLY 撞上该时段已生效的 M2 借用时，M1 在**同一事务内**清退该 M2 限制
+        （置 RELEASED），并通知该借用的申请人。清退数量在响应 `evictedBookingCount` 中返回
+      reason: |
+        报修优先级最高（安全与设施问题），教室物理不可用时借用无法履行。
+        通知收件人来自 M2 APPLY 时携带的 `ownerUserId` —— M1 不存申请人信息，
+        靠这个字段在清退时知道该通知谁，无需反向回调 M2。
+      owner: B
+    - id: CP-6
+      rule: |
+        M1 清退 M2 借用时，**M2 的申请单状态不联动**。
+        「该教室当前是否被占用」以 M1 的 seat_restriction 为准，
+        M2 的申请单停留在原状态（如 APPROVED），可自行展示「占用已被维修清退」
+      reason: |
+        若联动，需要 M1 → M2 的回调接口，引入反向依赖与分布式事务，
+        为一个状态展示付出过高代价。申请单是「审批记录」，占用是「现场事实」，
+        两者分离是刻意的。
+      owner: B
+
+x-advance-window-constraint:
+  description: |
+    **提前期窗口的约束不等式。改参数时必须重新验算，否则冲突规避机制会静默失效。**
+
+    设计意图：让「审批完成的最晚时刻」早于「座位预约开放的最早时刻」，
+    使 M2 与 M1 的冲突**根本不发生**，而不是发生后靠清退兜底。
+
+    设目标日为 T，必须满足：
+
+        seat_advance_days  <  room_advance_days − approval_timeout_days
+
+    代入当前取值：
+
+        1  <  7 − 3  =  4      ✅ 成立，留 3 天缓冲
+
+    时间线（最坏情况）：
+
+        T-7  社团提交借用申请
+        T-4  审批完成（3 天时限的最后一刻）→ 教室锁定
+        T-1  学生座位预约开放 → 此时教室状态已确定，不会撞车
+
+    若有人把审批时限放宽到 7 天：右边变为 0，1 < 0 不成立，
+    审批窗口与预约窗口重叠，**冲突重新出现且无人察觉**（代码照样跑）。
+  formula: seat_advance_days < room_advance_days - approval_timeout_days
+  current_values:
+    room_advance_days: 7
+    approval_timeout_days: 3
+    seat_advance_days: 1
+    buffer_days: 3
+  related_parameters:
+    - BOOKING_ADVANCE_DAYS_ROOM
+    - BOOKING_APPROVAL_TIMEOUT_DAYS
+    - RESERVATION_ADVANCE_DAYS_SEAT
+  prerequisites:
+    - id: AW-1
+      rule: 审批超时必须有**强制自动动作**，不允许一直挂着
+      reason: |
+        挂着的申请会把审批窗口拖过 T-1，冲突窗口重新打开。
+        自动动作由 M2-005「超时自动撤销」承担：超 3 天未处理即自动撤销。
+    - id: AW-2
+      rule: 申请被驳回后，不可对同一教室同一时段重新提交
+      reason: |
+        重投会把审批窗口推到 T-1，与座位预约开放撞在同一天，产生竞态。
+        若业务上允许重投，则重投的审批时限必须缩短到 1 天以内。
+  not_covered:
+    - id: AW-3
+      case: M3 报修不受提前期约束
+      reason: |
+        报修是突发事件（今天坏、明天修），没有「提前申请」环节，
+        无法用时间窗口拉开。因此 M3 与 M1 的冲突**只能靠清退机制兜底**。
+        这也是 x-conflict-priority 中 M3 优先级最高的原因。
+
+paths: {}
+
+components:
+
+  parameters:
+    IdempotencyKey:
+      name: X-Idempotency-Key
+      in: header
+      required: false
+      description: |
+        格式 `<sourceType>:<sourceId>:<action>`。
+        仅用于日志关联与排障，**不承担幂等判定**。
+        幂等由数据库唯一约束物理保证。
+      schema:
+        type: string
+        pattern: '^(M1|M2|M3):[0-9a-fA-F-]{36}:[A-Z_]+$'
+
+    TraceId:
+      name: X-Trace-Id
+      in: header
+      required: false
+      description: 调用链追踪号，服务端必须原样回填到错误响应的 traceId 字段
+      schema:
+        type: string
+
+  schemas:
+
+    Uuid:
+      type: string
+      format: uuid
+      pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+      description: |
+        所有业务主键统一 UUID。
+        注意：OpenAPI 的 format: uuid 只是注解，多数校验器不生效，**pattern 才是硬校验**。
+
+    UtcDateTime:
+      type: string
+      format: date-time
+      pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$'
+      description: |
+        时间一律 UTC 且带 Z 后缀。数据库存 UTC，接口传 UTC。
+        时段重叠判定使用**半开区间 [from, to)**，避免相邻时段（9-10 与 10-11）误判冲突。
+
+    SourceType:
+      type: string
+      enum: [M1, M2, M3]
+      description: 跨模块影响的来源模块标识
+
+    # ── 角色字典：A 主责确认 ───────────────────────────────
+    Role:
+      type: string
+      description: |
+        全组唯一角色字典。**禁止任何模块自建角色名或加前缀。**
+        M2 两级审批直接引用 APPROVER_DEPT 与 APPROVER_UNIVERSITY。
+      enum:
+        - STUDENT            # 学生
+        - ROOM_ADMIN         # 教室/院系管理员
+        - PROPERTY_STAFF     # 物业人员
+        - ACCEPTER           # 验收人员 / 报修人
+        - OPERATIONS_ADMIN   # 运营管理员（只读）
+        - SYSTEM_ADMIN       # 系统管理员
+        - APPROVER_DEPT      # M2 初审：所属院系/空间管理员
+        - APPROVER_UNIVERSITY # M2 终审：校级资源管理员
+      x-owner: A
+
+    # ── 统一错误模型 ─────────────────────────────────────
+    ErrorCode:
+      type: string
+      description: |
+        统一错误码。**大写下划线，不使用自然语言，不面向前端展示。**
+        这是最容易各写各的地方：务必引用本枚举，不要发明 PARAM_ERROR 之类。
+      enum:
+        - INVALID_ARGUMENT   # 参数非法
+        - UNAUTHORIZED       # 无 token 或失效
+        - FORBIDDEN          # 无权操作该资源
+        - NOT_FOUND          # 对象不存在
+        - CONFLICT           # 唯一约束冲突 / 状态冲突
+        - IDEMPOTENT_HIT     # 幂等命中（非错误，用于日志标记）
+        - INTERNAL_ERROR     # 服务内部异常
+      x-source: 沿用 m1-seat-restriction.yaml 已定义的六个
+
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [code, message, traceId]
+      description: 所有服务的所有错误响应必须套用此结构，不得自定义字段
+      properties:
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        message:
+          type: string
+          description: 面向开发者的英文短说明，不作为前端展示文案
+        traceId:
+          type: string
+          description: 与请求头 X-Trace-Id 一致；未传时服务端生成
+
+    # ── JWT claims 约定：A 确认 ──────────────────────────
+    JwtClaims:
+      type: object
+      description: |
+        JWT 载荷字段命名。四个服务都会解析 token，
+        字段名必须统一，否则鉴权实现必然四分五裂。
+      required: [sub, roles, exp]
+      properties:
+        sub:
+          type: string
+          format: uuid
+          description: 用户主键 UUID。**统一叫 sub，不要出现 userId / uid 混用**
+        roles:
+          type: array
+          items:
+            $ref: '#/components/schemas/Role'
+        dept:
+          type: string
+          format: uuid
+          description: 所属院系/组织，用于 M2 初审归属判断。可空
+        exp:
+          type: integer
+          description: 过期时间，Unix 秒
+        actorType:
+          type: string
+          enum: [USER, SYSTEM]
+          default: USER
+          description: |
+            发起方类型。**定时任务必须显式声明 `SYSTEM`**，不得冒充任何人类用户。
+            详见 `x-system-identity`。
+        taskId:
+          type: string
+          description: |
+            仅 `actorType=SYSTEM` 时必填。定时任务标识，用于审计追溯与重复触发防护，
+            如 `m1-checkin-timeout`、`m2-approval-timeout`、`m3-ticket-escalation`。
+      x-owner: A
+
+    # ── 审计事件字典：D 主责确认 ──────────────────────────
+    AuditAction:
+      type: string
+      description: |
+        审计动作字典。需求基线 §7.2 要求必记录的六类行为。
+        大写下划线，动词在前。
+      enum:
+        # ── 通用 ──
+        - LOGIN
+        - PERMISSION_CHANGE
+        - SYSTEM_PARAM_CHANGE
+        # ── M1 座位预约 ──
+        - RESERVATION_CREATE
+        - RESERVATION_CANCEL
+        - CHECKIN                  # 签到
+        - VIOLATION_RECORDED       # 违约记录（含未签到自动取消）
+        - RESERVATION_EVICTED      # 被高优先级占用清退（报修/整教室借用）
+        # ── M2 整教室借用 ──
+        - APPROVAL_DECIDE          # 审批通过 / 驳回
+        - BOOKING_ROLLBACK         # 手动撤销
+        - BOOKING_TIMEOUT_REVOKED  # 审批超时自动撤销（定时任务）
+        - BOOKING_EVICTED          # 借用被更高优先级（报修）清退，审计动作归 M1
+        # ── M3 报修工单 ──
+        - TICKET_STATUS_CHANGE
+        - TICKET_ESCALATED         # 超时升级（定时任务）
+        - TICKET_ACCEPTED          # 完工验收与评价
+      x-owner: D
+      x-note: |
+        后 6 个（CHECKIN 至 TICKET_ACCEPTED）为范围扩大后补充。
+        标注「定时任务」的两个由 SYSTEM 身份产生，见 x-system-identity。
+
+    # ── 通知类型字典：C 主责确认 ──────────────────────────
+    NotificationType:
+      type: string
+      description: |
+        统一通知类型。业务模块只传类型+收件人+内容，
+        不绑定具体渠道（v0.1 仅站内信与日志）。
+      enum:
+        # ── M1 座位预约 ──
+        - RESERVATION_REMINDER    # 预约前 15 分钟
+        - CHECKIN_REMINDER        # 开始后 10 分钟未签到
+        - RESERVATION_AUTO_CANCEL # 15 分钟未签到自动取消
+        - VIOLATION_RECORDED      # 违约已记录，告知学生
+        - RESERVATION_EVICTED     # 被高优先级占用清退（报修/整教室借用）
+        # ── M2 整教室借用 ──
+        - BOOKING_APPROVED
+        - BOOKING_REJECTED
+        - BOOKING_TIMEOUT_REVOKED # 审批超时自动撤销
+        - BOOKING_EVICTED          # 借用被报修清退，通知申请人（收件人=ownerUserId）
+        # ── M3 报修工单 ──
+        - TICKET_ASSIGNED
+        - TICKET_ESCALATED        # 超时升级
+        - TICKET_COMPLETED        # 完工待验收
+      x-owner: C
+
+    # ── 统一分页结构（后续各列表接口共用）────────────────
+    PageMeta:
+      type: object
+      required: [page, pageSize, total]
+      properties:
+        page:
+          type: integer
+          minimum: 1
+        pageSize:
+          type: integer
+          minimum: 1
+          maximum: 100
+        total:
+          type: integer
+          minimum: 0
+
+# ─────────────────────────────────────────────────────────
+x-pending-decisions:
+  description: 需明确确认后才能冻结的事项
+  items:
+    - id: PD-001
+      question: 四个服务如何校验 JWT？共享密钥、JWKS 端点、还是走 d-service 内省端点？
+      owner: A
+      blocks: [M1, M2, M3]
+      note: 不定则每个服务各写一套，合并时必炸
+    - id: PD-002
+      question: 空间/座位主数据的 REST 接口路径与字段（D-002）
+      owner: E
+      blocks: [M1]
+      note: 卡住 GET /api/m1/seats，B 无法开工
+    - id: PD-003
+      question: 业务参数读取接口路径与键名（D-005）
+      owner: A
+      blocks: [M1]
+      note: 卡住「最长预约时长」，B 目前只能写死 4 小时
+    - id: PD-004
+      question: 服务间调用的凭证如何传递？各自服务账号 + JWT 还是内部 token？
+      owner: A
+      blocks: [M1, M2, M3]
+    - id: PD-005
+      question: 角色枚举是否需要支持自定义角色，还是本期固定这 8 个
+      owner: A
+      blocks: [M1, M2, M3]
+      note: 建议本期固定，避免过度设计
+    - id: PD-006
+      question: |
+        教室/座位的「时段性不可用」归谁管？
+        主数据（新增写接口 + status=MAINTENANCE）还是业务层（统一进 seat_restriction）。
+      owner: E
+      co_owner: A
+      blocks: [M1, M2, M3]
+      note: |
+        B 建议方案 B（业务层），完整论证见 d-space-master-data.yaml 的 x-decision-log ADR-001。
+        核心理由：room.status 无时段字段，装不下 M2 的时段占用；
+        且同一教室可同时被 M2 与 M3 占用，一行记录写不下第二条。
+        未确认前 M3 无法开工。

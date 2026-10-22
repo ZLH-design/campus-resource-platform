@@ -1,0 +1,431 @@
+openapi: 3.1.0
+
+info:
+  title: M1 Seat Restriction API
+  version: 0.1.0
+  description: |
+    座位限制写回接口，服务于 INT-001（M2 审批占用）与 INT-002（M3 维修下架）。
+
+    本文件是全组唯一权威契约。任何字段或语义变更必须先修改本文件，
+    由调用方（M2/M3）与提供方（M1）负责人共同批准，再改代码。
+
+    幂等保证：数据库唯一约束 (sourceType, sourceId)。
+    RELEASE 只解除自己来源的限制，绝不影响其他来源。
+
+servers:
+  - url: http://localhost:8081
+    description: 本地 m1-service
+  - url: http://m1-service:8081
+    description: Docker Compose 内部网络
+
+tags:
+  - name: SeatRestriction
+    description: 座位限制的施加与解除
+  - name: Seats
+    description: 座位可用性查询
+
+paths:
+  /api/m1/seat-restrictions:
+    post:
+      tags: [SeatRestriction]
+      operationId: applyOrReleaseSeatRestriction
+      summary: 施加或解除座位限制
+      description: |
+        M2 审批通过时以 action=APPLY 占用整间教室；M2 驳回/撤销时以 action=RELEASE 释放。
+        M3 进入维修中时以 action=APPLY 下架整间教室；验收通过时以 action=RELEASE 恢复。
+
+        **不传 seatId。** v0.1 粒度为整间教室，M1 内部展开为该教室全部座位。
+
+        **冲突处置一（APPLY 时该时段已存在个人预约）：**
+        由 `onConflict` 字段决定，默认 `CANCEL_EXISTING`。
+        选择取消时，**取消与通知由 M1 在同一次调用内完成**：
+        调用方（M2/M3）不得自行查询预约、逐个取消、逐个发通知 ——
+        那样取消到一半失败会出现「一半人收到通知、一半人没收到」。
+        本接口保证原子性：要么全部取消并通知，要么整体失败。
+
+        **已签到 / 进行中的预约同样清退，且不记违约**（已定决策）：
+        学生可能正坐在教室里。清退时：
+        - 签到记录随预约一并失效，不留悬空状态
+        - 不记违约（CP-1，无论是否已签到）
+        - 通知文案必须区分：未开始的写「请重新预约」，
+          **已签到/进行中的写「教室临时不可用，请立即离开」** ——
+          人在现场却被通知「重新预约」是事故级的体验
+        - 后续签到超时任务扫到「已取消的预约」一律跳过，**不得补记违约**
+
+        **冲突处置二（M3 APPLY 撞上该时段已生效的 M2 借用）：**
+        M1 在**同一事务内**清退该 M2 限制（置 RELEASED），并通知该借用的
+        申请人（`ownerUserId`），响应返回 `evictedBookingCount`。
+        依据 `common.yaml` 的 CP-5：报修优先级最高，教室物理不可用时借用无法履行。
+        M2 的申请单状态**不联动**（见 CP-6）。
+        **部分重叠也整条清退**：维修 10–11 点、借用 9–13 点时，不按时段拆分借用，
+        直接整条清退（拆分逻辑 v0.1 不做，通知中提示重新申请）。
+
+        **冲突处置三（M2 APPLY 撞上同教室同时段任何一条其他来源的已生效限制）：**
+        拒绝，返回 409，**不改动任何已有记录**。覆盖两种情况：
+        - **M2 vs M2**（双重预定）：另一张申请单已 APPLY。
+          双重预定没有任何正当理由 —— 两个社团都以为自己批到了，当天会在门口吵架。
+        - **M2 vs M3**（批了一间维修中的教室）：该时段已有 M3 的 ACTIVE 限制。
+          维修中的教室办不了活动，让申请通过只会害申请人白跑一趟。
+
+        本接口是**第二层防线**。第一层在 M2 审批侧：审批人点「通过」前，
+        M2 自查同教室同时段是否已有 APPROVED 的申请（见 m2-service/AGENTS.md）。
+        第一层体验好但防不了并发 —— 两个审批人同一秒放行两张申请时，
+        靠本接口的 409 兜底。M2 **不得依赖**第一层自查（见 AW-1 / AW-2）。
+
+        判定规则：APPLY 且 `sourceType=M2` 时，检测同教室、时段重叠（半开区间）、
+        `status=ACTIVE`、且 `sourceId` 不同的限制记录 —— 命中即 409。
+
+        **幂等语义（必须严格实现）：**
+        - APPLY 且已存在 ACTIVE 记录 → 200，created=false，不新增
+        - APPLY 且已存在 RELEASED 记录 → 200，改回 ACTIVE 并更新时间，created=false
+        - RELEASE 且记录存在且 ACTIVE → 200，置 RELEASED 并写 releasedAt
+        - RELEASE 且记录不存在 → 200，什么都不做
+        - RELEASE 且记录已是 RELEASED → 200，不修改 releasedAt（保留首次解除时间）
+        - APPLY 幂等命中（created=false）时，**不重复清退预约、不重复清退 M2 借用、不重复发通知**
+
+        **RELEASE 永不取消任何预约，也不恢复任何已被取消的预约。**
+        被清退的预约不可逆，学生只能重新预约。
+
+        `X-Idempotency-Key` 仅用于日志关联与排障，不承担幂等判定。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: './common.yaml#/components/parameters/TraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SeatRestrictionCommand'
+            examples:
+              m2Apply:
+                summary: M2 审批通过，占用整间教室
+                value:
+                  sourceType: M2
+                  sourceId: 3f1c9a2e-8b4d-4f6a-9e21-7c5d0b8a1f33
+                  ownerUserId: 9e4b1a77-2c3d-4e5f-8a90-1b2c3d4e5f67
+                  roomId: a72e1b40-5d3c-4e8f-8a91-2b6c4d7e9f10
+                  startAt: '2026-10-22T01:00:00Z'
+                  endAt: '2026-10-22T05:00:00Z'
+                  action: APPLY
+              m3Apply:
+                summary: M3 转维修中，下架整间教室
+                value:
+                  sourceType: M3
+                  sourceId: 8d2b7c11-4e6a-4c3b-9f18-5a0e7d2c6b94
+                  roomId: a72e1b40-5d3c-4e8f-8a91-2b6c4d7e9f10
+                  startAt: '2026-10-22T02:00:00Z'
+                  endAt: '2026-10-22T10:00:00Z'
+                  action: APPLY
+              m3Release:
+                summary: M3 验收通过，只解除本工单造成的限制
+                value:
+                  sourceType: M3
+                  sourceId: 8d2b7c11-4e6a-4c3b-9f18-5a0e7d2c6b94
+                  roomId: a72e1b40-5d3c-4e8f-8a91-2b6c4d7e9f10
+                  startAt: '2026-10-22T02:00:00Z'
+                  endAt: '2026-10-22T10:00:00Z'
+                  action: RELEASE
+      responses:
+        '200':
+          description: 处理成功（含幂等的重复请求）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SeatRestrictionResult'
+              examples:
+                applied:
+                  summary: APPLY 新建成功
+                  value:
+                    restrictionId: 5c9e2f13-7a4b-4d81-b3c6-9e0f2a7d4c58
+                    status: ACTIVE
+                    created: true
+                appliedDuplicate:
+                  summary: APPLY 重复请求（幂等）
+                  value:
+                    restrictionId: 5c9e2f13-7a4b-4d81-b3c6-9e0f2a7d4c58
+                    status: ACTIVE
+                    created: false
+                released:
+                  summary: RELEASE 成功
+                  value:
+                    restrictionId: 5c9e2f13-7a4b-4d81-b3c6-9e0f2a7d4c58
+                    status: RELEASED
+                    created: false
+                releasedMissing:
+                  summary: RELEASE 但记录不存在（幂等）
+                  value:
+                    restrictionId: null
+                    status: RELEASED
+                    created: false
+                appliedWithCancel:
+                  summary: APPLY 且清退了已有预约
+                  value:
+                    restrictionId: 5c9e2f13-7a4b-4d81-b3c6-9e0f2a7d4c58
+                    status: ACTIVE
+                    created: true
+                    cancelledReservationCount: 12
+                m3ApplyWithEvict:
+                  summary: M3 APPLY 且清退了已生效的 M2 借用
+                  value:
+                    restrictionId: 6d0f3a24-8b5c-4e92-c4d7-0f1a3b8e5d69
+                    status: ACTIVE
+                    created: true
+                    cancelledReservationCount: 12
+                    evictedBookingCount: 1
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/m1/seats:
+    get:
+      tags: [Seats]
+      operationId: listSeats
+      summary: 查询座位与可用性
+      description: |
+        `available` 的判定只在 M1 内部完成，调用方不得自行推断：
+        available = 该时段无个人预约 AND 该时段无 status='ACTIVE' 的限制。
+
+        时间按半开区间 [from, to) 判断重叠，避免相邻时段误判。
+      parameters:
+        - name: roomId
+          in: query
+          required: false
+          description: 指定教室；不传则返回当前用户有权访问的全部
+          schema:
+            type: string
+            format: uuid
+        - name: from
+          in: query
+          required: true
+          description: 起始时间，UTC，按整点
+          schema:
+            type: string
+            format: date-time
+          example: '2026-10-22T01:00:00Z'
+        - name: to
+          in: query
+          required: true
+          description: 结束时间，UTC，必须大于 from
+          schema:
+            type: string
+            format: date-time
+          example: '2026-10-22T05:00:00Z'
+        - name: hasSocket
+          in: query
+          required: false
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: 座位列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SeatView'
+              example:
+                - seatId: b1d4e7a2-3c5f-4a8e-9b21-6d3f0c7e4a95
+                  roomId: a72e1b40-5d3c-4e8f-8a91-2b6c4d7e9f10
+                  seatNo: A-12
+                  hasSocket: true
+                  available: false
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+components:
+  parameters:
+    IdempotencyKey:
+      name: X-Idempotency-Key
+      in: header
+      required: false
+      description: |
+        格式 `<sourceType>:<sourceId>:<action>`。仅用于排障与日志关联，不承担幂等判定。
+
+        **本份刻意收窄为 M2|M3**：本接口只被 M2（审批）与 M3（报修）调用，
+        M1 不会调用自己，故不允许 M1 出现在 sourceType。这是收紧，不是笔误。
+      schema:
+        type: string
+        pattern: '^(M2|M3):[0-9a-fA-F-]{36}:(APPLY|RELEASE)$'
+      example: M3:8d2b7c11-4e6a-4c3b-9f18-5a0e7d2c6b94:RELEASE
+
+  schemas:
+    SeatRestrictionCommand:
+      type: object
+      additionalProperties: false
+      required: [sourceType, sourceId, roomId, startAt, endAt, action]
+      properties:
+        sourceType:
+          type: string
+          enum: [M2, M3]
+          description: 来源模块。M2 为整教室审批，M3 为物业报修
+        sourceId:
+          type: string
+          format: uuid
+          pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+          description: |
+            M2 为申请单主键，M3 为工单主键。
+            必须是 UUID。若使用自增整型，视为契约违反。
+            pattern 为硬校验：`format: uuid` 只是注解，多数校验器不生效。
+        ownerUserId:
+          type: string
+          format: uuid
+          pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+          description: |
+            **申请单的主人（申请人用户 ID）**。M2 必传；M3 不得传（工单没有「申请人」概念，
+            维修通知走 M3 自己的流程）。
+
+            为什么 M1 需要它：M1 的 seat_restriction 表只存 sourceId（申请单号），
+            申请人在 M2 的库里。将来 M3 报修撞上这笔借用、M1 清退时，
+            通知的 recipientId 就是这个字段 —— M2 APPLY 时顺手带过来，
+            一个字段解决「M1 知道单号却不知道该通知谁」的问题，
+            不需要 M1 反向回调 M2、也不需要跨模块查库。
+        roomId:
+          type: string
+          format: uuid
+          pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+          description: 教室主键。M1 内部展开为该教室全部座位
+        startAt:
+          type: string
+          format: date-time
+          pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$'
+          description: 影响开始时间，UTC，ISO 8601 带 Z 后缀
+        endAt:
+          type: string
+          format: date-time
+          pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$'
+          description: 影响结束时间，UTC，必须晚于 startAt
+        action:
+          type: string
+          enum: [APPLY, RELEASE]
+          description: APPLY 施加限制；RELEASE 解除限制
+        onConflict:
+          type: string
+          enum: [CANCEL_EXISTING, REJECT]
+          default: CANCEL_EXISTING
+          description: |
+            **仅 APPLY 时生效**，RELEASE 忽略本字段。
+
+            当目标时段内已存在个人预约时的处置方式：
+
+            - `CANCEL_EXISTING`（默认）：取消冲突的个人预约，逐个发通知，
+              并在响应中返回 `cancelledReservationCount`。
+              被取消的学生**不记违约** —— 不是学生的过错。
+            - `REJECT`：拒绝本次 APPLY，返回 409，**不改动任何已有预约**。
+              适用于调用方希望自己先跟学生协调的场景。
+
+            两种取值都不会修改其他来源（M2/M3）已存在的限制记录。
+            完整优先级规则见 `common.yaml` 的 `x-conflict-priority`。
+
+    SeatRestrictionResult:
+      type: object
+      required: [status, created]
+      properties:
+        restrictionId:
+          type: [string, 'null']
+          format: uuid
+          description: 限制记录主键。RELEASE 时若记录不存在则为 null
+        status:
+          type: string
+          enum: [ACTIVE, RELEASED]
+          description: 本次操作后的记录状态
+        created:
+          type: boolean
+          description: true 表示本次调用新建了记录；false 表示幂等命中或仅为状态变更
+        cancelledReservationCount:
+          type: integer
+          minimum: 0
+          description: |
+            本次 APPLY 因冲突而取消的个人预约数量。
+            - `onConflict=REJECT` 时恒为 0
+            - `onConflict=CANCEL_EXISTING` 时为实际取消数
+            - RELEASE 时恒为 0（RELEASE 永不取消预约）
+            用于调用方展示与排障，不参与幂等判定。
+        evictedBookingCount:
+          type: integer
+          minimum: 0
+          description: |
+            本次 APPLY（仅 sourceType=M3）因冲突而清退的 M2 借用数量。
+            - M3 APPLY 撞上该时段已生效的 M2 限制 → 清退并计数（见冲突处置二）
+            - sourceType=M2 或 action=RELEASE 时恒为 0
+            - 幂等命中（created=false）时恒为 0（不重复清退）
+            被清退方（M2 申请人）的通知由 M1 在同一事务内发出。
+
+    SeatView:
+      type: object
+      required: [seatId, roomId, seatNo, hasSocket, available]
+      properties:
+        seatId:
+          type: string
+          format: uuid
+        roomId:
+          type: string
+          format: uuid
+        seatNo:
+          type: string
+          description: 座位编号，如 A-12
+        hasSocket:
+          type: boolean
+        available:
+          type: boolean
+          description: 该时段无个人预约且无 ACTIVE 限制时为 true
+
+  responses:
+    BadRequest:
+      description: |
+        参数非法。常见原因：
+        - sourceType 不在 [M2, M3]
+        - sourceId 非 UUID
+        - sourceType=M2 但缺 ownerUserId，或 sourceType=M3 却传了 ownerUserId
+        - endAt 不晚于 startAt
+        - action 不在 [APPLY, RELEASE]
+        - 出现未定义字段（additionalProperties: false）
+      content:
+        application/json:
+          schema:
+            $ref: './common.yaml#/components/schemas/ErrorResponse'
+          example:
+            code: INVALID_ARGUMENT
+            message: endAt must be after startAt
+            traceId: a1b2c3d4
+    Unauthorized:
+      description: 无 token 或 token 失效
+      content:
+        application/json:
+          schema:
+            $ref: './common.yaml#/components/schemas/ErrorResponse'
+          example:
+            code: UNAUTHORIZED
+            message: missing or invalid bearer token
+            traceId: a1b2c3d4
+    Forbidden:
+      description: 调用方服务账号无权操作该教室
+      content:
+        application/json:
+          schema:
+            $ref: './common.yaml#/components/schemas/ErrorResponse'
+          example:
+            code: FORBIDDEN
+            message: service account has no permission on room
+            traceId: a1b2c3d4
+    Conflict:
+      description: |
+        - **M2 APPLY 撞上同教室同时段其他来源的已生效限制**（双重预定 / 维修中教室，见冲突处置三）
+          → 拒绝，已有记录不受影响
+        - `onConflict=REJECT` 且目标时段内存在个人预约 → 拒绝，已有预约不受影响
+        - 唯一约束冲突且非幂等场景 → 理论上不应出现，出现即为实现缺陷
+      content:
+        application/json:
+          schema:
+            $ref: './common.yaml#/components/schemas/ErrorResponse'
+          example:
+            code: CONFLICT
+            message: another active restriction exists for this room and period
+            traceId: a1b2c3d4

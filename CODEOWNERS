@@ -1,0 +1,21 @@
+# 跨模块契约：提供方与调用方必须共同批准
+/openapi/                       @A @B @C @D @E
+
+# 各服务目录：模块负责人 + 架构负责人
+/services/m1-service/           @B @A
+/services/m2-service/           @C @A
+/services/m3-service/           @D @A
+/services/d-service/            @E @A
+
+# 数据库迁移：模块负责人 + 工程化负责人
+/**/db/migration/               @E @A
+
+# 治理与决策文件
+/AGENTS.md                      @A
+/总约束_v0.1.md                 @A
+/docs/requirements/             @A
+/docs/adr/                      @A
+
+# 仓库规范与 CI
+/.github/                       @E @A
+/deploy/                        @E @A

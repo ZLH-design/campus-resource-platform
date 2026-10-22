@@ -1,0 +1,184 @@
+openapi: 3.1.0
+
+info:
+  title: D-005 业务参数接口
+  version: 0.1.0-draft
+  description: |
+    供 M1/M2/M3 读取业务参数（最长预约时长、提醒阈值等）。
+
+    **草案，待 A 确认后冻结。** 确认方式：回复"确认"或指出要改的字段。
+
+    设计原则：业务模块**不得在代码中写死参数值**，必须通过本接口读取。
+    参数变更必须写审计（见 d-audit.yaml）。
+
+servers:
+  - url: http://localhost:8084
+    description: 本地 d-service
+  - url: http://d-service:8084
+    description: Docker Compose 内部网络
+
+tags:
+  - name: Parameter
+    description: 业务参数读取
+
+paths:
+  /api/d/parameters/{key}:
+    get:
+      tags: [Parameter]
+      operationId: getParameter
+      summary: 读取单个参数
+      description: |
+        返回值统一用字符串传输，由调用方按 `type` 自行转换。
+        原因：避免 JSON 数字精度问题，且不同参数类型可共用一个接口。
+
+        参数不存在 → 404，**不返回默认值**。因为"静默使用默认值"会掩盖配置缺失。
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+          example: RESERVATION_MAX_DURATION_HOURS
+        - $ref: './common.yaml#/components/parameters/TraceId'
+      responses:
+        '200':
+          description: 参数存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Parameter'
+              example:
+                key: RESERVATION_MAX_DURATION_HOURS
+                value: '4'
+                type: INTEGER
+                description: 单次预约最长时长（小时）
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/d/parameters:
+    get:
+      tags: [Parameter]
+      operationId: listParameters
+      summary: 批量读取参数
+      description: 调用方一次取多个参数，减少往返。不存在的 key 不出现在结果中。
+      parameters:
+        - name: keys
+          in: query
+          required: true
+          description: 逗号分隔的参数名
+          schema:
+            type: string
+          example: RESERVATION_MAX_DURATION_HOURS,CHECKIN_TIMEOUT_MINUTES
+      responses:
+        '200':
+          description: 参数列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Parameter'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+components:
+  schemas:
+    Parameter:
+      type: object
+      additionalProperties: false
+      required: [key, value, type]
+      properties:
+        key:
+          type: string
+        value:
+          type: string
+          description: 一律字符串，调用方按 type 转换
+        type:
+          type: string
+          enum: [INTEGER, BOOLEAN, STRING]
+        description:
+          type: string
+
+  responses:
+    Unauthorized:
+      description: 无 token 或失效
+      content:
+        application/json:
+          schema:
+            $ref: './common.yaml#/components/schemas/ErrorResponse'
+          example:
+            code: UNAUTHORIZED
+            message: missing or invalid bearer token
+            traceId: a1b2c3d4
+    NotFound:
+      description: 参数不存在
+      content:
+        application/json:
+          schema:
+            $ref: './common.yaml#/components/schemas/ErrorResponse'
+          example:
+            code: NOT_FOUND
+            message: parameter not found
+            traceId: a1b2c3d4
+
+x-required-parameter-keys:
+  description: 首轮必须预置的参数，缺一个 M1 就跑不通
+  items:
+    - key: RESERVATION_MAX_DURATION_HOURS
+      value: '4'
+      type: INTEGER
+      usedBy: M1-002
+    - key: RESERVATION_REMINDER_MINUTES
+      value: '15'
+      type: INTEGER
+      usedBy: M1-004
+    - key: CHECKIN_REMINDER_MINUTES
+      value: '10'
+      type: INTEGER
+      usedBy: M1-004
+    - key: CHECKIN_TIMEOUT_MINUTES
+      value: '15'
+      type: INTEGER
+      usedBy: M1-004
+    - key: RESERVATION_ADVANCE_DAYS_SEAT
+      value: '1'
+      type: INTEGER
+      usedBy: M1-002
+      note: 座位最多可提前几天预约
+    - key: BOOKING_ADVANCE_DAYS_ROOM
+      value: '7'
+      type: INTEGER
+      usedBy: M2-001
+      note: 整教室借用最多可提前几天提交申请
+    - key: BOOKING_APPROVAL_TIMEOUT_DAYS
+      value: '3'
+      type: INTEGER
+      usedBy: M2-005
+      note: |
+        审批超过此天数未处理则自动撤销（M2-005 超时自动撤销）。
+        本值与上两个值共同决定冲突规避是否成立，改值前必须验算。
+    - key: TICKET_ESCALATION_TIMEOUT_HOURS
+      value: '24'
+      type: INTEGER
+      usedBy: M3-005
+      note: |
+        **草案取值，待 D 确认。** 工单派单后超过此小时数未进入维修中则自动升级。
+        对应定时任务，由 SYSTEM 身份执行（见 common.yaml 的 x-system-identity）。
+
+# ─────────────────────────────────────────────────────────
+# 参数之间的约束：改动前必须验算
+# ─────────────────────────────────────────────────────────
+x-parameter-constraints:
+  - id: PC-1
+    name: 提前期窗口不等式
+    formula: RESERVATION_ADVANCE_DAYS_SEAT < BOOKING_ADVANCE_DAYS_ROOM - BOOKING_APPROVAL_TIMEOUT_DAYS
+    current: 1 < 7 - 3 = 4
+    status: 成立，缓冲 3 天
+    why: |
+      保证「审批完成的最晚时刻」早于「座位预约开放的最早时刻」，
+      使 M2 与 M1 的冲突根本不发生。
+      违反此不等式不会报错，代码照样运行，只是冲突会重新出现且无人察觉。
+    details: 见 common.yaml 的 x-advance-window-constraint
+    owner: A

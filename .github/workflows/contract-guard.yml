@@ -1,0 +1,56 @@
+name: contract-guard
+
+on:
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 检测跨模块契约是否被修改
+        run: |
+          git diff --name-only origin/${{ github.base_ref }}...HEAD > changed.txt
+          cat changed.txt
+          if grep -qE '^openapi/.*\.(yaml|yml|json)$' changed.txt; then
+            echo "CONTRACT_CHANGED=true" >> $GITHUB_ENV
+            echo "::warning::跨模块契约被修改，需调用方与提供方共同批准"
+          fi
+
+      - name: 校验 OpenAPI 契约合法性
+        if: env.CONTRACT_CHANGED == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml openapi-spec-validator
+          for f in $(grep -E '^openapi/.*\.(yaml|yml)$' changed.txt || true); do
+            [ -f "$f" ] || continue
+            echo "校验: $f"
+            openapi-spec-validator "$f" || exit 1
+          done
+
+      - name: 未获批准的契约变更一律阻断
+        if: env.CONTRACT_CHANGED == 'true' && ! contains(github.event.pull_request.labels.*.name, 'contract-approved')
+        run: |
+          echo "=============================================="
+          echo "本 PR 修改了 openapi/ 下的跨模块契约。"
+          echo "按总约束第 4 节：契约变更必须"
+          echo "  1) 先改契约文件，再改代码"
+          echo "  2) 调用方与提供方负责人共同批准"
+          echo "  3) 批准后由 Arbiter 添加 contract-approved 标签"
+          echo "当前缺少 contract-approved 标签，阻断合并。"
+          echo "=============================================="
+          exit 1
+
+      - name: 迁移文件序号冲突检查
+        run: |
+          dup=$(git diff --name-only origin/${{ github.base_ref }}...HEAD \
+                | grep -oE 'V[0-9]+__' | sort | uniq -d || true)
+          if [ -n "$dup" ]; then
+            echo "::error::检测到重复的 Flyway 版本号: $dup"
+            echo "迁移文件版本号重复会导致迁移失败，请重新编号。"
+            exit 1
+          fi

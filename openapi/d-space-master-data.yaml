@@ -1,0 +1,257 @@
+openapi: 3.1.0
+
+info:
+  title: D-002 空间与座位主数据
+  version: 0.1.0-draft
+  description: |
+    供 M1（座位预约）查询教室与座位。M2/M3 也需要教室信息。
+
+    **草案，待 E 确认后冻结。** 这一份是当前最紧急的 —— 没有它 M1 的查询接口做不出来。
+
+    数据边界：主数据在 `common` schema，M1 不能跨 schema 直查，只能通过本接口。
+    注销的教室/座位不返回。
+
+    **本接口只表达静态属性与永久状态，不表达任何时段性可用性。**
+    「某教室在某时段是否可用」由 M1 的 `seat_restriction` 统一回答，见
+    `openapi/m1-seat-restriction.yaml`。理由见本文件末尾 `x-decision-log`。
+
+servers:
+  - url: http://localhost:8084
+    description: 本地 d-service
+  - url: http://d-service:8084
+    description: Docker Compose 内部网络
+
+tags:
+  - name: Room
+    description: 教室
+  - name: Seat
+    description: 座位
+
+paths:
+  /api/d/rooms:
+    get:
+      tags: [Room]
+      operationId: listRooms
+      summary: 查询教室列表
+      description: |
+        只返回 `status = ACTIVE` 的教室。已注销的（CLOSED）不返回。
+
+        **注意：返回的教室仍然可能在该时段不可用**（被 M2 审批占用、被 M3 维修下架）。
+        本接口不参与可用性判定，调用方需要时段可用性请查 M1。
+
+        过滤条件全部可选，不传则返回当前用户有权访问的全部教室。
+      parameters:
+        - name: building
+          in: query
+          schema: { type: string }
+          example: 图书馆
+        - name: floor
+          in: query
+          schema: { type: integer }
+          example: 3
+        - name: hasSocket
+          in: query
+          description: 该教室是否存在带插座的座位
+          schema: { type: boolean }
+        - name: openFrom
+          in: query
+          description: 筛选在该时刻之前已开放的教室（UTC）
+          schema: { type: string, format: date-time }
+        - name: openTo
+          in: query
+          description: 筛选在该时刻之后才关闭的教室（UTC）
+          schema: { type: string, format: date-time }
+        - $ref: './common.yaml#/components/parameters/TraceId'
+      responses:
+        '200':
+          description: 教室列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Room'
+              example:
+                - id: a72e1b40-5d3c-4e8f-8a91-2b6c4d7e9f10
+                  name: 图书馆三层自习室
+                  building: 图书馆
+                  floor: 3
+                  openFrom: '00:00'
+                  openTo: '23:00'
+                  seatCount: 48
+                  status: ACTIVE
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/d/rooms/{roomId}:
+    get:
+      tags: [Room]
+      operationId: getRoom
+      summary: 查询单个教室
+      parameters:
+        - name: roomId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: 教室详情
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Room'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/d/rooms/{roomId}/seats:
+    get:
+      tags: [Seat]
+      operationId: listSeatsByRoom
+      summary: 查询某教室的座位
+      description: |
+        只返回 `status = ACTIVE` 的座位。
+
+        **注意：本接口只返回座位静态属性，不返回可用性。**
+        可用性由 M1 根据预约和限制自行判定 —— 主数据服务不知道预约状态。
+      parameters:
+        - name: roomId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: hasSocket
+          in: query
+          schema: { type: boolean }
+      responses:
+        '200':
+          description: 座位列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Seat'
+              example:
+                - id: b1d4e7a2-3c5f-4a8e-9b21-6d3f0c7e4a95
+                  roomId: a72e1b40-5d3c-4e8f-8a91-2b6c4d7e9f10
+                  seatNo: A-12
+                  hasSocket: true
+                  status: ACTIVE
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  schemas:
+    Room:
+      type: object
+      additionalProperties: false
+      required: [id, name, building, floor, openFrom, openTo, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        building:
+          type: string
+        floor:
+          type: integer
+        openFrom:
+          type: string
+          description: 开放时间，HH:mm（本地时间，用于展示与筛选）
+          example: '00:00'
+        openTo:
+          type: string
+          example: '23:00'
+        seatCount:
+          type: integer
+        status:
+          type: string
+          enum: [ACTIVE, CLOSED]
+          description: |
+            **永久状态，不带时段。** 只有 ACTIVE 会被返回给调用方。
+
+            - `ACTIVE`：正常存在，可承接业务
+            - `CLOSED`：永久注销（拆除、改作他用），不再返回
+
+            原草案中的 `MAINTENANCE` 已移除 —— 维修是**时段性**状态，
+            由 M3 通过 M1 的 `seat_restriction`（sourceType=M3）表达，不进主数据。
+            理由见文件末尾 `x-decision-log`。
+
+    Seat:
+      type: object
+      additionalProperties: false
+      required: [id, roomId, seatNo, hasSocket, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        roomId:
+          type: string
+          format: uuid
+        seatNo:
+          type: string
+          example: A-12
+        hasSocket:
+          type: boolean
+        status:
+          type: string
+          enum: [ACTIVE, DISABLED]
+          description: |
+            座位的永久状态。`DISABLED` 表示座位被永久移除（如改造），不含维修。
+            维修导致的不可用由 M1 的 `seat_restriction` 表达。
+
+  responses:
+    Unauthorized:
+      description: 无 token 或失效
+      content:
+        application/json:
+          schema: { $ref: './common.yaml#/components/schemas/ErrorResponse' }
+          example:
+            code: UNAUTHORIZED
+            message: missing or invalid bearer token
+            traceId: a1b2c3d4
+    NotFound:
+      description: 教室或座位不存在
+      content:
+        application/json:
+          schema: { $ref: './common.yaml#/components/schemas/ErrorResponse' }
+          example:
+            code: NOT_FOUND
+            message: room not found
+            traceId: a1b2c3d4
+
+# ─────────────────────────────────────────────────────────
+# 架构决策记录（本文件为草案，以下决策需 E 与 A 确认后生效）
+# ─────────────────────────────────────────────────────────
+x-decision-log:
+  - id: ADR-001
+    title: 教室/座位的时段性状态归属业务层，不进主数据
+    status: 建议采纳，待 E 与 A 确认
+    raised_by: B
+    date: '2026-10-22'
+    context: |
+      M3 工单转「维修中」时需要让教室不可用，但主数据只有 3 个 GET、没有写接口，
+      且总约束禁止跨 schema 直写 common。M3 无处可写状态。
+    decision: |
+      采用方案 B：所有时段性占用统一写入 m1 schema 的 `seat_restriction`
+      （sourceType=M2 审批占用 / sourceType=M3 维修下架，各带 start_at、end_at）。
+      主数据的 `Room.status` 退化为 [ACTIVE, CLOSED]，只表达永久状态。
+    rejected_alternative: |
+      方案 A（主数据管状态，新增 PATCH /api/d/rooms/{roomId}/status）被否决，三条理由：
+      1. room.status 是无时段字段，装不下 M2「10-22 09:00 至 13:00 被占用」这种时段语义；
+      2. 同一间教室可能同时被 M2 和 M3 占用，一行记录写不下第二条；
+         真要支持就得在 common 里新建时段表，等于把 seat_restriction 搬进 common，
+         违反「common 只放主数据、不承载业务状态」；
+      3. 会产生两处需要同步的真相，课程项目没有分布式事务，只能靠补偿。
+    consequences: |
+      - 主数据接口保持纯读，无需新增写接口、权限点、审计动作
+      - M2 与 M3 机制统一：同一个接口、同一张表、同一套幂等语义
+      - 单一真相来源，无需同步与补偿
+      - 代价：前端查教室列表拿不到「是否维修中」，需再查一次 M1
+        （v0.1 接受；后续可由 M1 提供批量可用性查询接口）
+    impacts:
+      files:
+        - openapi/d-space-master-data.yaml（本文件，已改）
+        - openapi/m1-seat-restriction.yaml（无需改动，sourceType 已支持 M3）
+        - openapi/common.yaml（新增 PD-006 跟踪本决策）
+      owners: [E, A]
